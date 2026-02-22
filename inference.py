@@ -1,7 +1,7 @@
 import torch
 from torchvision.utils import make_grid, save_image
 from model_group_1.dit import DiT
-from model import RectifiedFlow
+from model_new import RectifiedFlow
 import os
 import argparse
 import numpy as np

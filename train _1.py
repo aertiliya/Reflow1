@@ -263,7 +263,7 @@ def main():
         # project_name="seisFFN-sample30-fwi",
         # project_name="large_openfwi"
         # project_name="better-fusing"
-        project_name="spx"  # 🚀 新实验：15k样本验证修复版
+        project_name="abc"  # 🚀 新实验：15k样本验证修复版
     )
 
     # Log unet code to Comet
@@ -286,7 +286,7 @@ def main():
         "batch_size": batch_size,
         "learning_rate": 3e-4,  # 🚀 初始学习率3e-4（Requirements 8.1）
         "CureFaultB": "UnetConcat_InputConcatenation",  # 🚀 Input Concatenation 架构
-        "dim": 64,  # 🚀 模型维度192（Requirements 2.2, 7.1）
+        "dim": 128,  # 🚀 模型维度192（Requirements 2.2, 7.1）
         # "depth": 12,
         # "num_heads": 6,
         "patch_size": 2,
@@ -306,7 +306,7 @@ def main():
         "loss_balance_strategy": "adaptive_scheduling",  # 🔥 标记：自适应调度法（Requirements 5.1-5.5）
         "sigma_min": 1e-06,
         "ema_decay": 0.9999,
-        "dataset_size": 45000,  # 🔥 扩大到45k样本
+        "dataset_size": 48000,  # 🔥 扩大到45k样本
         "use_fft_wavelet": USE_FFT_WAVELET,  # 🔬 实验开关
         "use_improved_seis_encoder": True,  # 🚀 使用ImprovedSeisEncoder（Requirements 2.2, 7.1）
     })
@@ -316,7 +316,7 @@ def main():
         T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
     ])
 
-    folder = '/openfwi/data'
+    folder = r'C:\Users\MSI\Desktop\openfwi\data'
 
     # dataset and dataloader
     # class_dict = ['CurveFaultA', 'CurveFaultB', 'CureFaultB', 'CurveVelA', 'FlatFaultA', 'FlatFaultB', 'FlatVelA', 'FlatVelB']
@@ -481,10 +481,8 @@ def main():
                     return np.load(file_path, mmap_mode='r')
 
         def __len__(self):
-            # 🚀 扩大数据集：使用前 45000 个样本（60个npy文件 * 500样本/文件）
-            # 理由：30k样本可能不够，增加到45k提升泛化能力
             total_samples = sum([info[2] for info in self.x_info])
-            return min(total_samples, 45000)
+            return min(total_samples, 48000)
 
         def __getitem__(self, idx):
             # 定位文件
@@ -983,7 +981,7 @@ def main():
                 loss_ssim = criterion_ssim(pred, u_positive)
 
                 # 简单对比学习
-                contrastive_weight = 0.1
+                contrastive_weight = 0.5
                 if contrastive_weight > 0 and b > 1:
                     # 展平特征
                     pred_flat = pred.flatten(start_dim=1)
@@ -1180,6 +1178,28 @@ def main():
                     auto_cleanup.main(quick_mode=True, verbose=False)
                 except Exception as e:
                     print(f"⚠️ 自动清理失败: {e}")
+
+    checkpoint_path = os.path.join(checkpoint_root_path, "model_fwi_final.pth")
+    state_dict = {
+        "CureFaultB": model.state_dict(),
+        "ema_model": ema_model.state_dict(),
+        "config": {
+            "dataset": "openfwi",
+            "image_size": image_size,
+            "image_channels": image_channels,
+            "sigma_min": sigma_min,
+            "lambda_weight": lambda_weight,
+            "training_cfg_rate": training_cfg_rate,
+            "gradient_clip": gradient_clip,
+            "ema_decay": ema_decay,
+        }
+    }
+    torch.save(state_dict, checkpoint_path)
+
+    experiment.log_model(
+        name="final_model",
+        file_or_folder=checkpoint_path
+    )
 
     experiment.end()
 

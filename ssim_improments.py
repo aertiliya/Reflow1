@@ -23,15 +23,15 @@ import torch.nn.functional as F
 class LearnableTimePooling(nn.Module):
     """
     可学习时间池化模块
-    
+
     替代简单平均池化，让模型自动学习哪些时刻重要
-    
+
     Requirements: 1.2
     """
     def __init__(self, in_channels: int, target_size: int = 64):
         super().__init__()
         self.target_size = target_size
-        
+
         # 使用1D卷积进行可学习的时间压缩
         # 先用stride=4的卷积压缩，再用自适应池化微调到目标尺寸
         self.conv_pool = nn.Sequential(
@@ -39,10 +39,10 @@ class LearnableTimePooling(nn.Module):
             nn.GroupNorm(min(8, in_channels), in_channels),
             nn.SiLU(),
         )
-        
+
         # 最终自适应池化到目标尺寸
         self.adaptive_pool = nn.AdaptiveAvgPool1d(target_size)
-        
+
         # 可学习的注意力权重（时间维度）
         self.time_attention = nn.Sequential(
             nn.AdaptiveAvgPool1d(1),  # 全局平均池化
@@ -52,42 +52,42 @@ class LearnableTimePooling(nn.Module):
             nn.Linear(in_channels // 4, in_channels),
             nn.Sigmoid(),
         )
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x: (B, C, T) - 时间序列特征
-        
+
         Returns:
             (B, C, target_size) - 压缩后的时间特征
         """
         # 计算时间注意力权重
         attn = self.time_attention(x)  # (B, C)
         attn = attn.unsqueeze(-1)  # (B, C, 1)
-        
+
         # 应用注意力加权
         x = x * attn
-        
+
         # 可学习的卷积池化
         x = self.conv_pool(x)
-        
+
         # 自适应池化到目标尺寸
         x = self.adaptive_pool(x)
-        
+
         return x
 
 
 class SpatialAttention(nn.Module):
     """
     空间注意力模块
-    
+
     自适应选择重要接收器位置，不同接收器位置的重要性不同
-    
+
     Requirements: 1.3
     """
     def __init__(self, in_channels: int, reduction: int = 4):
         super().__init__()
-        
+
         # 通道注意力（SE-like）
         self.channel_attention = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
@@ -96,42 +96,42 @@ class SpatialAttention(nn.Module):
             nn.Conv2d(in_channels // reduction, in_channels, 1),
             nn.Sigmoid(),
         )
-        
+
         # 空间注意力（CBAM-like）
         self.spatial_attention = nn.Sequential(
             nn.Conv2d(2, 1, kernel_size=7, padding=3),
             nn.Sigmoid(),
         )
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x: (B, C, H, W) - 2D特征图
-        
+
         Returns:
             (B, C, H, W) - 注意力加权后的特征图
         """
         # 通道注意力
         ca = self.channel_attention(x)
         x = x * ca
-        
+
         # 空间注意力
         avg_out = torch.mean(x, dim=1, keepdim=True)
         max_out, _ = torch.max(x, dim=1, keepdim=True)
         spatial_input = torch.cat([avg_out, max_out], dim=1)
         sa = self.spatial_attention(spatial_input)
         x = x * sa
-        
+
         return x
 
 
 class LowFreqFFTExtractor(nn.Module):
     """
     低频FFT特征提取模块
-    
+
     仅保留前10%频率，避免高频噪声导致过拟合
     默认禁用，作为实验选项
-    
+
     Requirements: 1.5, 9.3
     """
     def __init__(self, in_sources: int = 5, out_channels: int = 10, freq_ratio: float = 0.1):
@@ -139,42 +139,42 @@ class LowFreqFFTExtractor(nn.Module):
         self.in_sources = in_sources
         self.out_channels = out_channels
         self.freq_ratio = freq_ratio  # 保留前10%频率
-        
+
         # 融合层：将低频特征融合到指定通道数
         # 确保num_groups能整除out_channels
         num_groups = min(4, out_channels)
         while out_channels % num_groups != 0 and num_groups > 1:
             num_groups -= 1
-        
+
         self.fusion = nn.Sequential(
             nn.Conv2d(in_sources, out_channels, kernel_size=1),
             nn.GroupNorm(num_groups, out_channels),
             nn.SiLU(),
         )
-    
+
     def forward(self, seis: torch.Tensor) -> torch.Tensor:
         """
         提取低频FFT特征（仅前10%频率）
-        
+
         Args:
             seis: (B, 5, 1000, 70) - 原始地震数据
-        
+
         Returns:
             (B, out_channels, 64, 64) - 低频特征图
         """
         B, S, T, R = seis.shape
-        
+
         # FFT沿时间维度
         fft = torch.fft.rfft(seis, dim=2)  # (B, 5, 501, 70)
-        
+
         # 只保留前10%频率
         n_freq = fft.shape[2]
         low_freq_idx = max(1, int(n_freq * self.freq_ratio))  # 至少保留1个频率
         low_freq = fft[:, :, :low_freq_idx, :]  # (B, 5, ~50, 70)
-        
+
         # 取幅度
         low_freq_amp = torch.abs(low_freq)  # (B, 5, ~50, 70)
-        
+
         # 插值到64x64
         low_freq_amp = F.interpolate(
             low_freq_amp,
@@ -182,10 +182,10 @@ class LowFreqFFTExtractor(nn.Module):
             mode='bilinear',
             align_corners=False
         )  # (B, 5, 70, 70)
-        
+
         # 融合到目标通道数
         low_freq_features = self.fusion(low_freq_amp)  # (B, out_channels, 70, 70)
-        
+
         return low_freq_features
 
 
@@ -193,24 +193,24 @@ class LowFreqFFTExtractor(nn.Module):
 class ImprovedSeisEncoder(nn.Module):
     """
     改进的地震数据编码器
-    
+
     关键改进:
     1. 可学习时间池化（替代简单平均池化）
     2. 空间注意力机制（自适应选择重要接收器）
     3. 震源感知特征聚合（替代简单拼接）
     4. 可选的低频FFT特征（仅前10%频率）
-    
+
     卷积使用策略:
     - Stage 1 (时间处理): Conv1d 沿时间轴，kernel_size=11
     - Stage 2 (空间处理): Conv2d 处理(T', R)的2D特征图
     - Stage 3 (特征融合): Conv2d 处理最终的64x64特征图
-    
+
     输入: (B, 5, 1000, 70) - 5个震源, 1000时间步, 70接收器
     输出: (B, 64, 70, 70) - 64通道, 70x70空间分辨率
-    
+
     Requirements: 1.1, 1.2, 1.3, 1.4, 9.2
     """
-    
+
     def __init__(
         self,
         in_channels: int = 5,
@@ -222,17 +222,17 @@ class ImprovedSeisEncoder(nn.Module):
         fft_channels: int = 10,  # 低频FFT特征通道数
     ):
         super().__init__()
-        
+
         # 验证conv1d_kernel_size在合理范围内 (Requirements 9.2)
         assert 7 <= conv1d_kernel_size <= 15, f"conv1d_kernel_size must be in [7, 15], got {conv1d_kernel_size}"
-        
+
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.use_low_freq_fft = use_low_freq_fft
         self.conv1d_kernel_size = conv1d_kernel_size
         self.time_pool_learnable = time_pool_learnable
         self.use_spatial_attention = use_spatial_attention
-        
+
         # ========================================
         # Stage 1: 时间维度处理 (Conv1d)
         # 输入: (B*5*70, 1, 1000) -> 输出: (B*5*70, 32, T')
@@ -265,7 +265,7 @@ class ImprovedSeisEncoder(nn.Module):
             self.time_pool = LearnableTimePooling(in_channels=32, target_size=70)
         else:
             self.time_pool = nn.AdaptiveAvgPool1d(70)
-        
+
         # ========================================
         # Stage 2: 空间维度处理 (Conv2d)
         # 输入: (B*5, 32, 70, 70) -> 输出: (B*5, 64, 70, 70)
@@ -281,15 +281,15 @@ class ImprovedSeisEncoder(nn.Module):
             nn.GroupNorm(8, 64),
             nn.SiLU(),
         )
-        
 
-        
+
+
         # 空间注意力（自适应选择重要接收器位置）(Requirements 1.3)
         if use_spatial_attention:
             self.spatial_attention = SpatialAttention(in_channels=64, reduction=4)
         else:
             self.spatial_attention = None
-        
+
         # ========================================
         # Stage 3: 震源融合 (Conv2d)
         # 输入: (B, 5*64, 70, 70) -> 输出: (B, 64, 70, 70)
@@ -303,7 +303,7 @@ class ImprovedSeisEncoder(nn.Module):
             nn.GroupNorm(8, out_channels),
             nn.SiLU(),
         )
-        
+
         # 可选: 低频FFT特征 (Requirements 1.5, 9.3)
         self.use_low_freq_fft = use_low_freq_fft
         if use_low_freq_fft:
@@ -313,7 +313,7 @@ class ImprovedSeisEncoder(nn.Module):
                 freq_ratio=0.1  # 仅保留前10%频率
             )
             self.fft_fusion = nn.Conv2d(out_channels + fft_channels, out_channels, kernel_size=1)
-    
+
     def forward(self, seis: torch.Tensor) -> torch.Tensor:
         """
         处理流程:
@@ -323,18 +323,18 @@ class ImprovedSeisEncoder(nn.Module):
         4. 空间注意力（自适应选择接收器）
         5. 震源感知聚合（1x1卷积融合）
         6. 可选: 低频FFT特征融合（前10%频率）
-        
+
         Args:
             seis: (B, 5, 1000, 70) - 5个震源, 1000时间步, 70接收器
-        
+
         Returns:
             features: (B, 64, 70, 70) - 64通道, 70x70空间分辨率
         """
         B, S, T, R = seis.shape  # B, 5, 1000, 70
-        
+
         # 数据预处理：软限幅，保留动态范围
         seis = torch.tanh(seis / 2.0) * 2.0
-        
+
         # ========================================
         # Stage 1: 时间处理 (Conv1d)
         # ========================================
@@ -344,17 +344,17 @@ class ImprovedSeisEncoder(nn.Module):
 
         # 可学习时间池化
         x = self.time_pool(x)  # (B*5*70, 32, 70)
-        
+
         # ========================================
         # Stage 2: 空间处理 (Conv2d)
         # ========================================
         # Reshape: (B*5*70, 32, 70) -> (B*5, 32, 70, 70)
         x = x.reshape(B * S, R, 32, 70).permute(0, 2, 3, 1)  # (B*5, 32, 70, 70)
-        
+
         # 空间卷积
         x = self.spatial_conv(x)  # (B*5, 70, H, W)
 
-        
+
         # 空间注意力
         if self.spatial_attention is not None:
             x = self.spatial_attention(x)

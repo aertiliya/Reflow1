@@ -1,4 +1,4 @@
-﻿import math
+import math
 from functools import partial
 import torch
 from einops import rearrange, reduce, repeat
@@ -547,6 +547,20 @@ class UnetConcat(nn.Module):
         return self.final_conv(x)
 
     def forward_with_cfg(self, x, t, y, cfg_scale, is_train_student=False, seis=None):
+        """
+        Classifier-Free Guidance 推理
+
+        Args:
+            x: (B, 1, 64, 64) - 噪声图
+            t: 时间步
+            y: 类别标签
+            cfg_scale: CFG 缩放因子
+            is_train_student: 是否为学生模型训练
+            seis: (B, 5, 1000, 70) - 地震数据
+
+        Returns:
+            CFG 加权后的输出
+        """
         if is_train_student:
             t = t.repeat(2)
         else:
@@ -566,19 +580,65 @@ class UnetConcat(nn.Module):
 
 
 class ImprovedFeatureFusion(nn.Module):
-    """改进的特征融合模块 - 使用门控机制和残差连接"""
-
-    def __init__(self, dim):
+    """
+    AdaGN-based 特征融合模块
+    使用可学习的scale和bias进行自适应组归一化融合
+    """
+    def __init__(self, dim: int, num_groups: int = 8, eps: float = 1e-5):
         super().__init__()
-        self.residual_proj = nn.Sequential(
-            nn.Conv2d(dim * 2, dim, 1),
-            LayerNorm(dim)
+        assert dim % num_groups == 0, f"dim {dim} 必须能被 num_groups {num_groups} 整除"
+
+        self.dim = dim
+        self.num_groups = num_groups
+        self.eps = eps
+
+        # 生成调制参数（scale和bias）的轻量级网络
+        # 输入是seis的全局统计信息
+        self.style_encoder = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(dim, dim // 4),
+            nn.ReLU(inplace=True),
+            nn.Linear(dim // 4, dim * 2)  # 输出gamma和beta
         )
 
-    def forward(self, x, seis):
-        x = torch.cat((seis, x), dim=1)
-        residual = self.residual_proj(x)
-        return residual
+        # 可选：学习残差权重
+        self.gate = nn.Sequential(
+            nn.Conv2d(dim * 2, dim, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x: torch.Tensor, seis: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B, dim, H, W]
+            seis: [B, dim, H, W]
+        """
+        B, C, H, W = x.shape
+
+        # 1. 从seis提取风格参数（gamma, beta）
+        style_params = self.style_encoder(seis)  # [B, dim*2]
+        gamma = style_params[:, :self.dim].view(B, self.dim, 1, 1)  # scale
+        beta = style_params[:, self.dim:].view(B, self.dim, 1, 1)   # bias
+
+        # 2. 对x进行Group Norm并应用自适应参数
+        # 手动实现GroupNorm以便插入自适应参数
+        x_reshaped = x.view(B, self.num_groups, C // self.num_groups, H, W)
+        mean = x_reshaped.mean(dim=[2, 3, 4], keepdim=True)
+        var = x_reshaped.var(dim=[2, 3, 4], keepdim=True, unbiased=False)
+
+        x_normalized = (x_reshaped - mean) / torch.sqrt(var + self.eps)
+        x_normalized = x_normalized.view(B, C, H, W)
+
+        # 应用自适应scale和bias（来自seis）
+        modulated = x_normalized * (1 + gamma) + beta  # (1+gamma)保持恒等映射
+
+        # 3. 门控残差融合
+        gate = self.gate(torch.cat([x, seis], dim=1))
+        output = gate * modulated + (1 - gate) * x
+
+        return output
+
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ WEIGHT_PATH = r"C:\Users\MSI\Desktop\model_fwi_final-119999.pth"
 DATA_DIR = r"C:\Users\MSI\Desktop\openfwi\data\test_data"
 SAVE_RESIDUAL = False
 RESIDUAL_SAVE_DIR = r"C:\Users\MSI\Desktop\residuals"
-SAMPLE_STEPS = 20
+SAMPLE_STEPS = 2
 CFG_SCALE = 1.0
 
 # 🔥 SSIM 过滤阈值

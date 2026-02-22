@@ -5,7 +5,7 @@ from torch.distributions.transforms import SigmoidTransform
 import math
 
 # from dit import DiT
-from unet import  UnetConcat as Unet
+from unet import UnetConcat as Unet
 
 
 class LogitNormalCosineScheduler:
@@ -188,6 +188,7 @@ class RectifiedFlow(nn.Module):
 
         for step in range(1, len(t_span)):
             if self.use_cond and c is not None:
+                print(f"sample using cfg_scale: {cfg_scale}")
                 # 🚀 Task 8.2: 传递 seis 参数支持 UnetConcat
                 v_t = self.net.forward_with_cfg(z, t, c, cfg_scale, seis=seis)
             else:
@@ -220,24 +221,32 @@ class RectifiedFlow(nn.Module):
             raise ValueError("Cannot sample each class when num_classes is None")
 
         c = torch.arange(self.num_classes, device=self.device).repeat(n_per_class)
+        print('RectifiedFlow sample_each_class c shape: ', c.shape)
         z = torch.randn(self.num_classes * n_per_class, self.channels, self.image_size, self.image_size,
                         device=self.device)
-
+        z1 = z.clone()
 
         # FIXED: Consistent trajectory tracking
         images = [z.clone()] if return_all_steps else []
         t_span = self.get_timestep_schedule(sample_steps)
 
         t = t_span[0]
+        print('RectifiedFlow sample_each_class t shape:', t.shape)
+        t_next = t_span[1]
         dt = t_span[1] - t_span[0]
 
         for step in range(1, len(t_span)):
             if self.use_cond:
+                print(f"Using cfg_scale: {cfg_scale}")
                 v_t = self.net.forward_with_cfg(z, t, c, cfg_scale, is_train_student=False, seis=seis)
             else:
                 v_t = self.net(z, t)
 
-            z = z + dt * v_t
+            # 预测数据点
+            x_hat = z - v_t * t
+
+            # z = z + dt * v_t
+            z = (1 - t_next) * x_hat + t_next * z1
             t = t + dt
 
             # Store intermediate result
@@ -247,6 +256,7 @@ class RectifiedFlow(nn.Module):
             # Update dt for next step
             if step < len(t_span) - 1:
                 dt = t_span[step + 1] - t
+            t_next = t_next + dt
 
         # z_final = unnormalize_to_0_1(z.clip(-1, 1))
         z_final = z.clip(-1, 1)
@@ -257,62 +267,142 @@ class RectifiedFlow(nn.Module):
             return z_final, torch.stack(images)  # Keep trajectory in [-1, 1] for GIF creation
         return z_final
 
-    @classmethod
-    def from_checkpoint(cls, checkpoint_path, net, device="cuda"):
-        """
-        Create RectifiedFlow sampler from training checkpoint.
-        Automatically loads the correct scheduler parameters.
-        """
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        config = checkpoint.get('config', {})
 
-        # Extract scheduler parameters from checkpoint
-        use_logit_normal_cosine = config.get('timestep_sampling') == 'logit_normal_cosine'
+class DDPM(nn.Module):
+    def __init__(self, net: Unet,
+            device="cuda",
+            channels=3,
+            image_size=70,
+            num_classes=10
+            ):
+        super().__init__()
+        self.net = net
+        self.device = device
+        self.channels = channels
+        self.image_size = image_size
+        self.num_classes = num_classes
+        self.use_cond = num_classes is not None
 
-        sampler = cls(
-            net=net,
-            device=device,
-            channels=config.get('image_channels', 3),
-            image_size=config.get('image_size', 32),
-            num_classes=config.get('num_classes', 10),
-            use_logit_normal_cosine=use_logit_normal_cosine,
-            logit_normal_loc=config.get('logit_normal_loc', 0.0),
-            logit_normal_scale=config.get('logit_normal_scale', 1.0),
-            timestep_min=config.get('timestep_min', 1e-4),
-            timestep_max=config.get('timestep_max', 1.0 - 1e-4),
-        )
+    @torch.no_grad()
+    def sample(self, batch_size=None, class_labels=None, cfg_scale=5.0, timesteps=1000, seis=None):
+        # Determine batch size and conditioning
+        if class_labels is not None:
+            # Use provided class labels
+            batch_size = class_labels.shape[0]
+            c = class_labels.to(self.device)
+        elif self.use_cond and batch_size is not None:
+            # Generate random class labels
+            c = torch.randint(0, self.num_classes, (batch_size,), device=self.device)
+        elif batch_size is not None:
+            # No conditioning
+            c = None
+        else:
+            raise ValueError("Either batch_size or class_labels must be provided")
 
-        return sampler
+        x = torch.randn((batch_size, self.channels, self.image_size, self.image_size), device=self.device)
+
+        # 1. 预计算beta调度（线性调度）
+        scale = 1000 / timesteps
+        beta_start = scale * 1e-4
+        beta_end = scale * 0.02
+        betas = torch.linspace(beta_start, beta_end, timesteps, device=self.device)
+
+        # 2. 计算alpha相关参数
+        alphas = 1 - betas
+        alpha_cumulative = torch.cumprod(alphas, dim=0)  # ᾱ_t
+
+        for t in (range(1, timesteps)):
+            # 创建时间步张量
+            ts = torch.full((1,), t, dtype=torch.long, device=self.device)
+
+            # 噪声采样（最后一步不加噪声）
+            z = torch.randn_like(x) if t > 1 else torch.zeros_like(x)
+
+            # 预测噪声
+            predicted_noise = self.net.forward_with_cfg(x, ts, c, cfg_scale, is_train_student=False, seis=seis)
+
+            # 获取当前时间步的参数
+            beta_t = betas[t]
+            alpha_t = alphas[t]
+            alpha_cumulative_t = alpha_cumulative[t]
+
+            # 计算当前时间步的系数
+            one_by_sqrt_alpha_t = 1 / torch.sqrt(alpha_t)
+            sqrt_one_minus_alpha_cumulative_t = torch.sqrt(1 - alpha_cumulative_t)
+
+            # 调整维度以便广播
+            for _ in range(len(x.shape) - len(beta_t.shape)):
+                beta_t = beta_t.unsqueeze(-1)
+                one_by_sqrt_alpha_t = one_by_sqrt_alpha_t.unsqueeze(-1)
+                sqrt_one_minus_alpha_cumulative_t = sqrt_one_minus_alpha_cumulative_t.unsqueeze(-1)
+
+            # DDPM采样公式
+            x = (
+                    one_by_sqrt_alpha_t
+                    * (x - (beta_t / sqrt_one_minus_alpha_cumulative_t) * predicted_noise)
+                    + torch.sqrt(beta_t) * z
+            )
+
+            # 5. 返回生成的图像
+        return x
 
 
-# Example usage
-if __name__ == "__main__":
-    # Test the fixed implementation
-    from unet import Unet
 
-    model = Unet(
-        channels=1,
-        dim=64,
-        dim_mults=(1, 2, 4, 8),
-        num_classes=8,
-    )
+    @torch.no_grad()
+    def sample_each_class(self, n_per_class, cfg_scale=5.0, timesteps=1000, seis=None):
+        """Sample n_per_class images for each class."""
+        if not self.use_cond:
+            raise ValueError("Cannot sample each class when num_classes is None")
 
-    # Create sampler with logit-normal + cosine scheduling
-    sampler = RectifiedFlow(
-        net=model,
-        device="cuda" if torch.cuda.is_available() else "cpu",
-        channels=3,
-        image_size=64,
-        num_classes=8,
-        use_logit_normal_cosine=True,
-        logit_normal_loc=0.0,
-        logit_normal_scale=1.0,
-    )
+        c = torch.arange(self.num_classes, device=self.device).repeat(n_per_class)
+        print('RectifiedFlow sample_each_class c shape: ', c.shape)
+        x = torch.randn(self.num_classes * n_per_class, self.channels, self.image_size, self.image_size,
+                        device=self.device)
 
-    # Test sampling
-    with torch.no_grad():
-        samples = sampler.sample(batch_size=4, sample_steps=20)
-        print(f"Generated samples shape: {samples.shape}")
 
-        class_samples = sampler.sample_each_class(n_per_class=2, sample_steps=20)
-        print(f"Class samples shape: {class_samples.shape}")
+
+        # 1. 预计算beta调度（线性调度）
+        scale = 1000 / timesteps
+        beta_start = scale * 1e-4
+        beta_end = scale * 0.02
+        betas = torch.linspace(beta_start, beta_end, timesteps, device=self.device)
+
+        # 2. 计算alpha相关参数
+        alphas = 1 - betas
+        alpha_cumulative = torch.cumprod(alphas, dim=0)  # ᾱ_t
+
+        for t in reversed(range(1, timesteps)):
+            # 创建时间步张量
+            ts = torch.full((1,), t, dtype=torch.long, device=self.device)
+
+            # 噪声采样（最后一步不加噪声）
+            z = torch.randn_like(x) if t > 1 else torch.zeros_like(x)
+
+            # 预测噪声
+            predicted_noise = self.net.forward_with_cfg(x, ts, c, cfg_scale, is_train_student=False, seis=seis)
+
+            # 获取当前时间步的参数
+            beta_t = betas[t]
+            alpha_t = alphas[t]
+            alpha_cumulative_t = alpha_cumulative[t]
+
+            # 计算当前时间步的系数
+            one_by_sqrt_alpha_t = 1 / torch.sqrt(alpha_t)
+            sqrt_one_minus_alpha_cumulative_t = torch.sqrt(1 - alpha_cumulative_t)
+
+            # 调整维度以便广播
+            for _ in range(len(x.shape) - len(beta_t.shape)):
+                beta_t = beta_t.unsqueeze(-1)
+                one_by_sqrt_alpha_t = one_by_sqrt_alpha_t.unsqueeze(-1)
+                sqrt_one_minus_alpha_cumulative_t = sqrt_one_minus_alpha_cumulative_t.unsqueeze(-1)
+
+            # DDPM采样公式
+            x = (
+                    one_by_sqrt_alpha_t
+                    * (x - (beta_t / sqrt_one_minus_alpha_cumulative_t) * predicted_noise)
+                    + torch.sqrt(beta_t) * z
+            )
+
+            # 5. 返回生成的图像
+        return x
+

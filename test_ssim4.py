@@ -15,11 +15,11 @@ WEIGHT_PATH = r"C:\Users\MSI\Desktop\model_fwi_final-119999.pth"
 DATA_DIR = r"C:\Users\MSI\Desktop\openfwi\data\test_data"
 SAVE_RESIDUAL = False
 RESIDUAL_SAVE_DIR = r"C:\Users\MSI\Desktop\residuals"
-SAMPLE_STEPS = 20
+SAMPLE_STEPS = 3
 CFG_SCALE = 1.0
 
 # 🔥 SSIM 过滤阈值
-SSIM_THRESHOLD = 0.72  # SSIM 低于此值的样本将被过滤
+SSIM_THRESHOLD = 0.00  # SSIM 低于此值的样本将被过滤
 
 # 固定随机数种子
 def seed_torch(seed=42):

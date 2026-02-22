@@ -547,6 +547,20 @@ class UnetConcat(nn.Module):
         return self.final_conv(x)
 
     def forward_with_cfg(self, x, t, y, cfg_scale, is_train_student=False, seis=None):
+        """
+        Classifier-Free Guidance 推理
+
+        Args:
+            x: (B, 1, 64, 64) - 噪声图
+            t: 时间步
+            y: 类别标签
+            cfg_scale: CFG 缩放因子
+            is_train_student: 是否为学生模型训练
+            seis: (B, 5, 1000, 70) - 地震数据
+
+        Returns:
+            CFG 加权后的输出
+        """
         if is_train_student:
             t = t.repeat(2)
         else:
@@ -571,13 +585,12 @@ class ImprovedFeatureFusion(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.residual_proj = nn.Sequential(
-            nn.Conv2d(dim * 2, dim, 1),
+            nn.Conv2d(dim, dim, 1),
             LayerNorm(dim)
         )
 
     def forward(self, x, seis):
-        x = torch.cat((seis, x), dim=1)
-        residual = self.residual_proj(x)
+        residual = self.residual_proj(x + seis)
         return residual
 
 

@@ -547,6 +547,20 @@ class UnetConcat(nn.Module):
         return self.final_conv(x)
 
     def forward_with_cfg(self, x, t, y, cfg_scale, is_train_student=False, seis=None):
+        """
+        Classifier-Free Guidance 推理
+
+        Args:
+            x: (B, 1, 64, 64) - 噪声图
+            t: 时间步
+            y: 类别标签
+            cfg_scale: CFG 缩放因子
+            is_train_student: 是否为学生模型训练
+            seis: (B, 5, 1000, 70) - 地震数据
+
+        Returns:
+            CFG 加权后的输出
+        """
         if is_train_student:
             t = t.repeat(2)
         else:
@@ -566,19 +580,59 @@ class UnetConcat(nn.Module):
 
 
 class ImprovedFeatureFusion(nn.Module):
-    """改进的特征融合模块 - 使用门控机制和残差连接"""
-
-    def __init__(self, dim):
+    """
+    AdaIN-based 特征融合模块
+    使用seis的统计量（均值/方差）对x进行风格调制，保留x的内容结构
+    """
+    def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
-        self.residual_proj = nn.Sequential(
-            nn.Conv2d(dim * 2, dim, 1),
-            LayerNorm(dim)
-        )
+        self.eps = eps
+        self.dim = dim
 
-    def forward(self, x, seis):
-        x = torch.cat((seis, x), dim=1)
-        residual = self.residual_proj(x)
-        return residual
+        # 可选：学习一个混合权重
+        self.alpha = nn.Parameter(torch.zeros(1))
+
+        # 投影层，将调制后的特征映射回原始维度
+        self.post_proj = nn.Sequential(
+            nn.Conv2d(dim, dim, 3, padding=1),
+            nn.InstanceNorm2d(dim),
+            nn.ReLU(inplace=True)
+        )
+    def adain(self, content: torch.Tensor, style: torch.Tensor) -> torch.Tensor:
+        """
+        AdaIN: 将content的特征统计量适配到style
+        Args:
+            content: [B, C, H, W] - 内容特征（x）
+            style: [B, C, H, W] - 风格特征（seis）
+        """
+        # 计算均值和方差 [B, C, 1, 1]
+        content_mean = content.mean(dim=[2, 3], keepdim=True)
+        content_std = content.std(dim=[2, 3], keepdim=True) + self.eps
+
+        style_mean = style.mean(dim=[2, 3], keepdim=True)
+        style_std = style.std(dim=[2, 3], keepdim=True) + self.eps
+
+        # 标准化content，然后用style的统计量进行缩放和平移
+        normalized = (content - content_mean) / content_std
+        stylized = normalized * style_std + style_mean
+
+        return stylized
+
+    def forward(self, x: torch.Tensor, seis: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B, dim, H, W] - 主模态特征
+            seis: [B, dim, H, W] - 地震模态特征（作为风格）
+        Returns:
+            [B, dim, H, W] - 融合后的特征
+        """
+        # AdaIN调制：用seis的风格统计量调制x
+        fused = self.adain(x, seis)
+
+        # 可学习的残差混合
+        output = self.alpha * self.post_proj(fused) + (1 - self.alpha) * x
+
+        return output
 
 
 if __name__ == "__main__":

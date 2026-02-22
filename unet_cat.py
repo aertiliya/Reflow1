@@ -1,4 +1,4 @@
-﻿import math
+import math
 from functools import partial
 import torch
 from einops import rearrange, reduce, repeat

@@ -5,7 +5,7 @@ from torch.distributions.transforms import SigmoidTransform
 import math
 
 # from dit import DiT
-from unet import  UnetConcat as Unet
+from unet import UnetConcat as Unet
 
 
 class LogitNormalCosineScheduler:
@@ -144,7 +144,8 @@ class RectifiedFlow(nn.Module):
             return torch.linspace(0, 1, sample_steps + 1, device=self.device)
 
     @torch.no_grad()
-    def sample(self, batch_size=None, class_labels=None, cfg_scale=5.0, sample_steps=10, return_all_steps=False, seis=None):
+    def sample(self, batch_size=None, class_labels=None, cfg_scale=5.0, sample_steps=10, return_all_steps=False,
+               seis=None):
         """
         Sample images using configured scheduling.
 
@@ -188,6 +189,7 @@ class RectifiedFlow(nn.Module):
 
         for step in range(1, len(t_span)):
             if self.use_cond and c is not None:
+                print(f"sample using cfg_scale: {cfg_scale}")
                 # 🚀 Task 8.2: 传递 seis 参数支持 UnetConcat
                 v_t = self.net.forward_with_cfg(z, t, c, cfg_scale, seis=seis)
             else:
@@ -219,43 +221,52 @@ class RectifiedFlow(nn.Module):
         if not self.use_cond:
             raise ValueError("Cannot sample each class when num_classes is None")
 
-        c = torch.arange(self.num_classes, device=self.device).repeat(n_per_class)
-        z = torch.randn(self.num_classes * n_per_class, self.channels, self.image_size, self.image_size,
-                        device=self.device)
+        # 🔧 关键：在 try 之前保存状态并切换模式
+        was_training = self.net.training
+        self.net.eval()
 
+        try:
+            c = torch.arange(self.num_classes, device=self.device).repeat(n_per_class)
+            print('RectifiedFlow sample_each_class c shape: ', c.shape)
+            z = torch.randn(self.num_classes * n_per_class, self.channels, self.image_size, self.image_size,
+                            device=self.device)
 
-        # FIXED: Consistent trajectory tracking
-        images = [z.clone()] if return_all_steps else []
-        t_span = self.get_timestep_schedule(sample_steps)
+            images = [z.clone()] if return_all_steps else []
+            t_span = self.get_timestep_schedule(sample_steps)
 
-        t = t_span[0]
-        dt = t_span[1] - t_span[0]
+            t = t_span[0]
+            print('RectifiedFlow sample_each_class t shape:', t.shape)
+            dt = t_span[1] - t_span[0]
 
-        for step in range(1, len(t_span)):
-            if self.use_cond:
-                v_t = self.net.forward_with_cfg(z, t, c, cfg_scale, is_train_student=False, seis=seis)
-            else:
-                v_t = self.net(z, t)
+            for step in range(1, len(t_span)):
+                # 移除了这里的 self.net.eval()，只需在函数开头调用一次
 
-            z = z + dt * v_t
-            t = t + dt
+                if self.use_cond:
+                    print(f"Using cfg_scale: {cfg_scale}")
+                    v_t = self.net.forward_with_cfg(z, t, c, cfg_scale, is_train_student=False, seis=seis)
+                else:
+                    v_t = self.net(z, t)
 
-            # Store intermediate result
+                z = z + dt * v_t
+                t = t + dt
+
+                if return_all_steps:
+                    images.append(z.clone())
+
+                if step < len(t_span) - 1:
+                    dt = t_span[step + 1] - t
+
+            z_final = z.clip(-1, 1)
+
             if return_all_steps:
-                images.append(z.clone())
+                return z_final, torch.stack(images)
+            return z_final
 
-            # Update dt for next step
-            if step < len(t_span) - 1:
-                dt = t_span[step + 1] - t
-
-        # z_final = unnormalize_to_0_1(z.clip(-1, 1))
-        z_final = z.clip(-1, 1)
-        # z_final = z
-
-        if return_all_steps:
-            # Return both final image and full trajectory
-            return z_final, torch.stack(images)  # Keep trajectory in [-1, 1] for GIF creation
-        return z_final
+        finally:
+            # 🔧 安全恢复：只有之前是训练模式才切回来
+            if was_training:
+                self.net.train()
+                print("🔄 模型已恢复为 train 模式")
 
     @classmethod
     def from_checkpoint(cls, checkpoint_path, net, device="cuda"):

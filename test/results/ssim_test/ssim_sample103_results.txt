@@ -1,0 +1,5 @@
+Single Sample SSIM Comparison (index=103, 5-step, CFG=1.0)
+============================================================
+
+[base]  SSIM = 0.1750
+[0.5]  SSIM = 0.1397

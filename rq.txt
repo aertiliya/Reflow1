@@ -1,0 +1,19 @@
+pip install einops
+pip install timm
+pip install comet_ml
+pip install moviepy
+pip install matplotlib
+pip install scikit-image
+
+
+
+python Reflow2/train_1.py
+watch -n 1 nvidia-smi
+unzip Reflow2.zip
+
+
+
+python train_1.py
+
+
+
